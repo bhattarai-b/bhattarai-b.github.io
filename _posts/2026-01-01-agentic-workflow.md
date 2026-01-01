@@ -1016,13 +1016,12 @@ Agents are probably the most fragile clients of any API. Any minor change on the
 - Solution: **Add a adapter layer**. Never auto-generate the tool definitions from your internal API code. Instead, maintain a separate "Agent Interface Layer", that translates the API calls from agent to backend until the tool definitions are properly updated.
 ```{python}
 # The "Adapter Pattern" for Tools
-
-# 1. The INTERNAL API (Changes often, strict)
+# The INTERNAL API (Changes often, strict)
 def _internal_search_api(query, region, sort_by, limit):
     # complex logic...
     pass
 
-# 2. The AGENT TOOL (Frozen, tolerant)
+# The AGENT TOOL (Frozen, tolerant)
 # We map the Agent's simple view to the complex internal view.
 class SearchTool(BaseTool):
     name = "search"
@@ -1063,17 +1062,17 @@ If I understood anything, building an agent isn't about teaching a computer to t
 I have few additional topics below that I though were important for advanced Agentic workflows. But their importance migh change quickly as the models, services, and Agentic frameworks change. And finally, I will keep refining these notes whenever I can. These are not supposed to be organized cookbook, tutorial or book(There are much better materials out there). These are just the rambling that helped me to keep my thoughts a bit organized. So don't take anything in face value. 
 
 ---
-## additional topics:
-### Self Improving Agents
-### Guardrail-First Agents
+## A additional topics:
+### A.1 Self Improving Agents
+### A.2 Guardrail-First Agents
 Guardrails (or Safety Patterns) are crucial mechanisms that ensure intelligent agents operate safely, ethically, and as intended, particularly as the agents become more autonomous and embedded into critical systems. They can generate harmful, biased, unethical, or factually incorrect outputs, potentially causing the-real world damage. 
 
 ![Guardrails(Safety first) Pattern](/assets/images/guardrails.png "Adding safety guardrails to the agentic workflow")
 
 Guardrail-first agents provide solutions to manage the risks inherent in the agentic systems with multi-layered defense mechanism. In their simplest form, they wrap around the model such that we are validating the input to block malicious contents and filtering the outputs to catch undesireable responses. More advanced techniques include setting behavioral constraints via prompting, restricting tool usage, and integrating human-in-the-loop oversight for critical decisions. The goal of guardrails is not to limit agents utility, but to mold its behavior to favor trust, benefit, and predictability.
 
-### A2A: Agent 2 Agent communication protocol
-### Reasoning Capabilities
+### A.3 A2A: Agent 2 Agent communication protocol
+### A.4 Reasoning Capabilities
 Chain-of-Thought(CoT) prompting significantly improves the LLMs complex reasoning abilities. by mimicking step by step thought process. There are 2 ways we can introduce a strong reasoning into the agentic workflow.
 * Use SOTA reasoning models: These SOTA reasoning models have CoT baked in their reinforcement learning part, so that model automatically performs reasoning by breaking problem step by step.
 * Use explicit instructions on the prompt to force the CoT like behavior
@@ -1082,5 +1081,5 @@ Tree of Thoughts(ToT) is a more advanced reasoning technique that builds upon Co
 
 Self-correction (self-refinement) is a crucial aspect of an agent's reasoning process, particularly within CoT/ToT. It invovles agent's internal evaluation of it's generated content and intermediate thought process, identification of ambiguities, information gaps, and inaccuracy. It thereby adjusts its approach accordingly.
 
-### Prioritization
+### A.5 Prioritization
 AI Agents working on complex environments face a multitude of potential actions, conflicting goals, and finite resources. Without a clear method to determine their next move, these agents risk becoming ineffective. Prioritization provides a guideline for agents to rank tasks and goals and to undertake the most important ones first. This can be achieved by establishing clear criteria such as urgency, importance, dependencies, and resource cost. The agent then evaluates each potential next action against these criteria to determine the best course of action.
