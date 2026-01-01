@@ -1,12 +1,11 @@
 ---
-title: Building Agentic Workflows to Solve Real Problems
+title: Agent Layer- Building Agentic Workflows to Solve Real Problems
 author: Bibek Bhattarai
 date: 2026-01-01 1:42:00 +0800
 categories: [Blogging, Tutorial]
 tags: [writing]
 render_with_liquid: false
 ---
-# Agent Layer- Building Agentic Workflows to Solve Real Problems
 
 > **Disclaimer**: This is not a tutorial, book, or a whitepaper. The content on this file are notes I scrambled while learning the Agentic systems. The major resourses I have relied on are Andrew Ng's course on Agentic AI, as well as the book "Agentic Design Patterns" by Antonio Gulli. In addition to that I have looked into several blog posts, youtube videos, and whole lot of brainstorming with Gemini-3 models. I created this document to keep the things organized in a way that makes sense in my brain. If it does makes sense in you mind as well, feel free to use it. 
 ---
@@ -227,14 +226,12 @@ So far, our agentic patterns involves the interaction within the agents internal
 ![Tool Calling pattern: Agents interact with external world via function calls and APIs to gather additional context or to perform a specific task.](/assets/images/tool_calling.png "Tool Calling pattern.")
 
 A properly fleshed out "tool calling" enables many capabilities for an agent including:
-<list>
 * Information retrieval from external sources, e.g., weather API that returns current weather conditions
 * Interacting with Databases and APIs, e.g., API call to check inventory 
 * Performing calculations and Data Analysis, e.g., a calculator function, a stock market API, a spreadsheet tool
 * Sending communications, e.g., sending emails, messages, or making API calls to external communication services
 * Executing code, e.g., A code interpreter
 * Controlling Other systems or Devices, e.g., API to control smart home devices
-</list>
 
 Let's take an example of Research Assistant agent which will search for materials in different platforms to gather the necessary information. An example of this can be **arxiv_search_tool(query, max_results)** – a tool that searches for academic papers on given topic in arxiv. First, you need to write the function that will search arxiv for given topic and return top 5 results along with their meta-data. 
 
@@ -424,7 +421,7 @@ For example, a "research report writing" task might be decomposed and assigned t
 * **Writer Agent**: Writes the report based on the gathered resources
 * **Editor Agent**: Reflects on the report and provides suggestions for improvement.
 
-You can find the toy implemntation of one such multi-agent workflow here. <url>https://bhattarai-b/assets/research_agent/researcher_multi_agent.ipynb</url>
+You can find the toy implemntation of one such multi-agent workflow here. <https://bhattarai-b/assets/research_agent/researcher_multi_agent.ipynb>.
 The efficacy of such multi-agentic system is not only on the smart division of labour, but also dependent on the mechanisms for inter-agent communication. This requires a standardized communication protocol and a shared ontology, allowing agents to exchange data, delegate sub-tasks, and coordinate their actions to ensure that the final output if coherent.
 
 This distributed approach offs several advantages, including enhanced modularity, scalability, and robustness, as the failure of single agent does not necessarily cause a total system failure. The collaboration between agents can take various forms: 
@@ -436,8 +433,8 @@ This distributed approach offs several advantages, including enhanced modularity
 * **Critic-reviewer:** Agents create initial outputs such as plans, drafts and the second group of agents then critically assess theis output for adherence to policies, security, compliance, correctness, quality, and alignment with organizational objectives.
 
 For further readinng on multi-agent systems:
-* Multi-Agent Collaboration Mechanisms: A Survey of LLMs (https://arxiv.org/pdf/2501.06322)
-* Multi-Agent System — The Power of Collaboration (https://aravindakumar.medium.com/introducing-multi-agent-frameworks-the-power-of-collaboration-e9db31bba1b6)
+* Multi-Agent Collaboration Mechanisms: A Survey of LLMs: <https://arxiv.org/pdf/2501.06322>
+* Multi-Agent System — The Power of Collaboration <https://aravindakumar.medium.com/introducing-multi-agent-frameworks-the-power-of-collaboration-e9db31bba1b6>
 
 ---
 
@@ -449,11 +446,11 @@ Think of planning agent as a specialist to whom you delegate a complex task. Whe
 
 The trade-off to understand here is we are trading predictibility for flexibility. Dynamic planning is a specific tool, but not a universal solution. When a problem workflow is well understood and repeatable, constraining the agent to a well predetermined, fixed workflow is more effective. In addition to being more economic(from token economy standpoint), it reduces the uncertainty and the risk of un-predictable behavior.  
 
-It is recommended that the plan are generated in structured format like JSON or better yet as executable script. It has been observed that for complex problems requiring multiple sub-tasks, using executable code as workflow plans usually leads to better performance against plain-text plans and JSON format(Additional reading material: https://arxiv.org/pdf/2402.01030). In addition, the data and control flow are already encoded in the code-plan and you can easily include states as variables when we add memory to the agent (See chapter 6)
+It is recommended that the plan are generated in structured format like JSON or better yet as executable script. It has been observed that for complex problems requiring multiple sub-tasks, using executable code as workflow plans usually leads to better performance against plain-text plans and JSON format(Additional reading material: <https://arxiv.org/pdf/2402.01030>). In addition, the data and control flow are already encoded in the code-plan and you can easily include states as variables when we add memory to the agent (See chapter 3). However, it is necessary to properly sandbox your agent before running the codes orchestrated by planner agents as the mistakes can be costly.
 
 Here is a sample prompt used to create the workflow for managing the inventory and serve user requests.
 
-```
+```{python}
 PROMPT = """You are a senior data assistant. PLAN BY WRITING PYTHON CODE USING TINYDB.
 
 Database Schema & Samples (read-only):
@@ -534,7 +531,7 @@ User request:
 """
 ```
 Here's a typical routine to generate a workflow by taking in the user request as prompt.
-```
+```{python}
 def generate_llm_code(
     prompt: str,
     *,
@@ -568,7 +565,7 @@ def generate_llm_code(
 
 ```
 When we call this function with a specific user request like this 
-```
+```{python}
 # Andrew's prompt from the lecture
 prompt_round = "Do you have any round sunglasses in stock that are under $100?"
 
@@ -586,7 +583,7 @@ utils.print_html(full_content_round, title="Plan with Code (Full Response)")
 ```
 
 The output you get from this function invocation is executable python script like below. 
-```
+```{python}
 <execute_python>
 #1. Import necessary modules
 from tinydb import Query
@@ -664,7 +661,7 @@ print(f"LOG: ACTION=read DRY_RUN=True STATUS={STATUS}")
 ---
 
 ## 6: Model Control Protocols (MCP)
-As discussed, to enable the agents capability beyond multimodal generation, interaction with external environment is necessary, including access to current data, utilization of external software, and execuiton of specific operational tasks. Model Control Protocol(MCP) statndardizes this iterface to enable consistent and predictable integration (<url>https://www.anthropic.com/news/model-context-protocol</url>). It is an open standard that enables developers to build two-way connections between their data sources and AI-powered tools. With this architecture, you can either expose your data through MCP servers or build AI applications(MCP clients) that connect to these servers (https://www.youtube.com/watch?v=N3vHJcHBS-w )
+As discussed, to enable the agents capability beyond multimodal generation, interaction with external environment is necessary, including access to current data, utilization of external software, and execuiton of specific operational tasks. Model Control Protocol(MCP) statndardizes this iterface to enable consistent and predictable integration (<https://www.anthropic.com/news/model-context-protocol>). It is an open standard that enables developers to build two-way connections between their data sources and AI-powered tools. With this architecture, you can either expose your data through MCP servers or build AI applications(MCP clients) that connect to these servers (<https://www.youtube.com/watch?v=N3vHJcHBS-w> )
 
 ![Model control protocol infused within the agentic workflow.](/assets/images/mcp.png  "MCP server-client integration into the agentic workflow.")
 
@@ -760,7 +757,7 @@ if __name__ == "__main__":
 ```
 
 You get following outputs. As you can see we can get the available tools, resources, and prompts as well as invoke any of these components from client residing within agentic workflow. 
-```
+```{python}
 Tools: ['echo_tool']
 Resources: [AnyUrl('echo://static')]
 Prompts: ['echo']
@@ -776,16 +773,16 @@ When building an agentic system, it's hard to know where it works and where it w
 One of the most practical way to approach early stage evaluation is hand-crafting a ground truth set and performing inspection of workflow's performance on that dataset. For e.g., in our invoice processing system, we can manually extract the required field from test set and compare them against the agent generated records. If we get plenty of records that has mixed-up dates, we know that is something we should focus on evaluation. 
 
 Here's a toy guideline on how we can formulate this evaluation. 
-<list>
-> 1. Manually extract due dates from test-sets invoices "December 29, 2025" -> "2025/12/29"
-> 2. Direct LLM to return dates in specific formate. "... Format due date as YYYY/MM/DD"
-> 3. Extract data from LLM response using code 
-```
+1. Manually extract due dates from test-sets invoices "December 29, 2025" -> "2025/12/29"
+2. Direct LLM to return dates in specific formate. "... Format due date as YYYY/MM/DD"
+3. Extract data from LLM response using code 
+
+```{python}
  date_pattern = r'\d{4}/\d{2}/\d{2}'
  extracted_date = re.findall(date_pattern, llm_response)
 ``` 
 > 4. Compare LLM result to ground truth
-```
+```{python}
 if (extracted_date == actual_date):
     num_correct += 1
 ```
@@ -868,11 +865,11 @@ A production-grade agent framework must support a 'Resume' feature. If a 50-step
 Lets say one of your run failed with a bug in your code (e.g., your JSON parser crashed because the LLM returned invalid JSON). If you just rerun the workflow, the LLM might return valid JSON this time, and the bug disappears ("Heisenbug"). You can't fix what you can't reproduce.
 
 With trace capture and replay, we can avoid such situation. Lets say update your json parser with potential fix. You can test your update as follows:
-<list>
+
 * Load the State from Step before the json parsing happens
 * Mock the LLM: inject the exact string recorded in the Trace in place of LLM endpoint call
 * Run your JSON parsing logic
-</list>
+
 This enables you to reproduce the crash 100% of the time, allowing you to patch your parser and test reliably.
 
 ```{python}
@@ -924,7 +921,7 @@ For soft failures, i.e., the system produces the result but they are not of desi
 | Batteries for electric vehicles            |                   | only non-us companies included                  | missed a magazine            |     |     |
 | % of failures                              | 5%                | 45%                                             | 10%                          | ... | ... |
 
-Once we have such empirical attributions, it is quite clear that we need to focus first on fixing the web_search by tuning the LLMs web search prompts. As the system matures, we can develop more automated systems for error attribution by developing a comprehensive evals like we discussed in chapter 6. 
+Once we have such empirical attributions, it is quite clear that we need to focus first on fixing the web_search by tuning the LLMs web search prompts. As the system matures, we can develop more automated systems for error attribution by developing a comprehensive evals like we discussed in chapter 7. 
 
 ---
 
