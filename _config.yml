@@ -14,9 +14,9 @@ timezone:
 # jekyll-seo-tag settings › https://github.com/jekyll/jekyll-seo-tag/blob/master/docs/usage.md
 # ↓ --------------------------
 
-title: Bibek Bhattarai # the main title
+title: Bibek # the main title
 
-tagline: Place where jot down my thoughts # it will display as the subtitle
+tagline: Place where I jot down my thoughts # it will display as the subtitle
 
 description: >- # used by seo meta and the atom feed
   I write about whatever dumb stuff is consuming my mind at a time.
