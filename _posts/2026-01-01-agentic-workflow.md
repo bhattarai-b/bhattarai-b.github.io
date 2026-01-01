@@ -1014,15 +1014,20 @@ Traditional software usually breaks because someone changes the code. AI breaks 
 Agents are probably the most fragile clients of any API. Any minor change on them can cause the workflow to suffer catastrophically. Consider a scenario:
 - Problem: The agent uses a tool `get_customer_data(id)`. The backend team changed the API to require `get_customer_data(id, region)`, but the agent keeps on calling the old signature. It either hallucinates the region or crashes the program.
 - Solution: **Add a adapter layer**. Never auto-generate the tool definitions from your internal API code. Instead, maintain a separate "Agent Interface Layer", that translates the API calls from agent to backend until the tool definitions are properly updated.
+
 ```{python}
-# The "Adapter Pattern" for Tools
-# The INTERNAL API (Changes often, strict)
+"""
+The "Adapter Pattern" for Tools
+The INTERNAL API (Changes often, strict)
+"""
 def _internal_search_api(query, region, sort_by, limit):
     # complex logic...
     pass
 
-# The AGENT TOOL (Frozen, tolerant)
-# We map the Agent's simple view to the complex internal view.
+"""
+The AGENT TOOL (Frozen, tolerant)
+We map the Agent's simple view to the complex internal view.
+"""
 class SearchTool(BaseTool):
     name = "search"
     description = "Finds documents. Input: query string."
@@ -1039,7 +1044,9 @@ class SearchTool(BaseTool):
             sort_by="date",# Defaulted
             limit=5
         )
+
 ```
+---
 
 ### 12.3 Operational Constraints
 Your agent is a while loop with a credit card. So you need to contain it.
@@ -1062,7 +1069,7 @@ If I understood anything, building an agent isn't about teaching a computer to t
 I have few additional topics below that I though were important for advanced Agentic workflows. But their importance migh change quickly as the models, services, and Agentic frameworks change. And finally, I will keep refining these notes whenever I can. These are not supposed to be organized cookbook, tutorial or book(There are much better materials out there). These are just the rambling that helped me to keep my thoughts a bit organized. So don't take anything in face value. 
 
 ---
-## A additional topics:
+## A Additional Topics
 ### A.1 Self Improving Agents
 ### A.2 Guardrail-First Agents
 Guardrails (or Safety Patterns) are crucial mechanisms that ensure intelligent agents operate safely, ethically, and as intended, particularly as the agents become more autonomous and embedded into critical systems. They can generate harmful, biased, unethical, or factually incorrect outputs, potentially causing the-real world damage. 
