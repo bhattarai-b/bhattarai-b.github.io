@@ -7,7 +7,7 @@ tags: [writing]
 render_with_liquid: false
 ---
 
-> **Disclaimer**: This is not a tutorial, book, or a whitepaper. The content on this file are notes I scrambled while learning the Agentic systems. The major resourses I have relied on are Andrew Ng's course on Agentic AI, as well as the book "Agentic Design Patterns" by Antonio Gulli. In addition to that I have looked into several blog posts, youtube videos, and whole lot of brainstorming with Gemini-3 models. I created this document to keep the things organized in a way that makes sense in my brain. If it does makes sense in you mind as well, feel free to use it. 
+> **Disclaimer**: This is not a tutorial, book, or a whitepaper. The content on this file are notes I scrambled while learning the Agentic systems. The major resourses I have relied on are Andrew Ng's course on Agentic AI, as well as the book "Agentic Design Patterns" by Antonio Gulli. In addition to that I have looked into several blog posts, youtube videos, and whole lot of brainstorming with Gemini-3 models. I created this document to keep the things organized in a way that makes sense in my brain. If it does makes sense in your mind as well, feel free to use it. 
 ---
 
 ## 1. What Is an Agentic Workflow?
