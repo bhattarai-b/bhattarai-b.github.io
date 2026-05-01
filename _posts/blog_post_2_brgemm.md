@@ -1,0 +1,998 @@
+# Building a Production-Grade GEMM Library with oneDNN's BRGeMM Micro-Kernels
+
+*Part 2 of the "Accelerating Deep Learning on Modern CPUs" series*
+
+---
+
+## Recap: Where We Left Off
+
+In [Part 1](blog_post.md), we walked through the evolution of matrix multiplication on CPUs — from a naive triple loop (730ms) through loop reordering (130ms) and tiling (89ms), all the way to AMX's 2D tile registers that can deliver 1024 BF16 ops/cycle.
+
+But hand-coding AMX tile intrinsics (`_tile_loadd`, `_tile_dpbssd`, etc.) for every matrix shape, data type, and ISA generation is impractical. What if there were something that:
+
+- JIT-compiles ISA-optimal micro-kernels for your specific hardware
+- Handles the batch-reduce pattern (accumulating K-blocks) natively
+- Supports BF16, INT8, and FP32 through the same API
+- Lets you control the outer tiling while it handles the inner compute
+
+Enter **oneDNN's Batch-Reduce GEMM (BRGeMM) micro-kernels**.
+
+In this post, we'll build a complete, high-performance GEMM library on top of BRGeMM — with two-level caching, autotuning, multi-threaded dispatch, and support for the matrix shapes that actually matter in LLMs. All the code lives in this repository.
+
+---
+
+## What Is BRGeMM?
+
+BRGeMM stands for **Batch-Reduce General Matrix Multiply**. It's a low-level GEMM primitive exposed by [oneDNN](https://github.com/oneapi-src/oneDNN) (with `DNNL_EXPERIMENTAL_UKERNEL` enabled) that sits under almost every CPU GEMM you'll encounter in practice: deep-learning frameworks ([PyTorch](https://pytorch.org/), [TensorFlow](https://www.tensorflow.org/), [JAX](https://jax.readthedocs.io/)) dispatch through oneDNN on CPU; LLM inference libraries like [gemma.cpp](https://github.com/google/gemma.cpp) and [llama.cpp](https://github.com/ggerganov/llama.cpp) call it directly; and serving platforms like [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang) rely on the same stack for their attention and FFN layers. When you run a transformer on a modern x86 box, chances are a BRGeMM kernel is doing the compute.
+
+The key idea: instead of computing a single $C = A \times B$, BRGeMM computes a **batch of small matrix multiplies and reduces (accumulates) them into a single output**:
+
+$$C = \sum_{i=0}^{\text{batch}-1} A_i \times B_i$$
+
+Each "batch element" corresponds to one K-dimension tile block. One BRGeMM call replaces the entire inner K-reduction loop, and oneDNN JIT-compiles an ISA-optimal kernel for the specific shape and data type.
+
+### Why Not Just Use SGEMM/DGEMM?
+
+| Feature | Traditional BLAS GEMM | BRGeMM Micro-Kernel |
+|---|---|---|
+| Granularity | Full matrix | Tile-level |
+| ISA dispatch | Library-internal, opaque | You control blocking; library handles ISA |
+| Data types | FP32/FP64 | FP32, BF16, INT8 (s8×s8, u8×s8) |
+| AMX utilization | Implicit | Explicit — maps directly to AMX tile ops |
+| Fusion | Limited | Post-ops (bias, ReLU, etc.) fused into kernel |
+| Batch reduction | Not native | Native — accumulate K-blocks without intermediate stores |
+| JIT compilation | Pre-compiled | Runtime codegen tuned to exact tile dimensions |
+
+---
+
+## The Architecture: What We're Building
+
+Our library (`gemm.h`) computes $C = A \times B^T \times \text{scale}$ where A is M×K, B is N×K (row-major, transposed), and C is M×N. It wraps oneDNN BRGeMM with:
+
+<!-- ```
+┌─────────────────────────────────────────────────────────────┐
+│  Public API: brgemm_gemm_execute(handle, A, B, C, M,K,N)   │
+├─────────────────────────────────────────────────────────────┤
+│  Autotuner: 4-round box search over tile configs            │
+├─────────────────────────────────────────────────────────────┤
+│  Kernel Cache: JIT brgemm objects keyed by (shape, config)  │
+│  Packed B Cache: Pre-packed B matrices keyed by pointer/dims│
+├─────────────────────────────────────────────────────────────┤
+│  K-Super-Blocking: batch_full / batch_rem / K-tail variants │
+├─────────────────────────────────────────────────────────────┤
+│  3-Way Parallel Dispatch:                                   │
+│    • 1-tile M: partition N across threads                   │
+│    • 2D M×N: partition both dimensions                      │
+│    • 1D coarse N: partition N, iterate all M                │
+├─────────────────────────────────────────────────────────────┤
+│  oneDNN BRGeMM ukernels (JIT to AMX / AVX-512 / AVX2)      │
+└─────────────────────────────────────────────────────────────┘
+``` -->
+
+![Architecture of a typical BRGeMM ukernel powered matmul implementation.](images2/brgemm_architecture.png)
+
+*Figure: A typical architecture of a BRGeMM ukernel powered matmult routine*
+
+### Dependencies
+
+- **oneDNN** (recent enough to support `DNNL_EXPERIMENTAL_UKERNEL`)
+- **TBB** (Threading Building Blocks, for parallel dispatch)
+- Linux with hugepage support (for the packed B buffer allocator)
+
+---
+
+## Supported Data Types
+
+The library supports four dtype modes, mapping to oneDNN's type system:
+
+```cpp
+enum brgemm_dtype_t {
+  BRGEMM_BF16,   // bf16 × bf16 → f32 accumulator
+  BRGEMM_F32,    // f32  × f32  → f32
+  BRGEMM_S8,     // s8   × s8   → s32 accumulator → f32 output
+  BRGEMM_U8S8,   // u8   × s8   → s32 accumulator → f32 output
+};
+```
+
+For BF16 and integer types, the accumulator is wider than the inputs (FP32 or INT32), and the final scale + cast to FP32 output happens after the last K-block.
+
+---
+
+## Building the Library, One Concept at a Time
+
+The rest of this post builds up the library in stages. Each stage adds exactly one idea on top of the previous one:
+
+1. **Output tiling** — carve C into tiles; each tile is an `A_slab × B_slab`
+2. **K-tiling and batch-reduce dispatch** — introduce BRGeMM; one call per tile
+3. **Parallel dispatch** — fan tiles out across threads
+4. **B-packing** — rearrange B for contiguous tile loads (hardware-forced on bf16/int8)
+5. **K-super-blocking** — keep the working set in L2 for large K
+6. **Tiling revisited** — M/N/K tails, kernel variants, the `execute_tile` loop, and a lightweight autotune
+7. **Kernel and packed-B caching** — amortize JIT and packing across calls
+8. **Adaptive dispatch** — choose a threading strategy per shape
+
+We start with the simplest version that computes the right answer, then add one concern at a time.
+
+---
+
+## Step 1: Output Tiling
+
+Before we introduce any micro-kernel, let's look at the output on its own. The output matrix C is M×N. We don't want to compute it one element at a time and we don't want to compute it all at once — we want to compute it in **tiles**: rectangular blocks of C, each small enough to live comfortably in registers and cache. 
+Tiled routines are one of the fundamental optimizations in most GEMM implementations. In addition to being the enabler of parallelization, which is necessary for utilizing modern CPUs/GPUs to their full potential, it enables a fine-grained breakdown of the large problem to allow for easier management of the multi-tier memory hierarchy.
+
+### Carving up C
+
+Pick two tile sizes:
+
+- `M_blk` — rows of C produced per tile (e.g., 32)
+- `N_blk` — columns of C produced per tile (e.g., 32)
+
+The output grid falls out directly. For M=128, N=96 with (M_blk, N_blk) = (32, 32):
+
+<!-- ```
+         N = 96
+        ┌───┬───┬───┐
+        │C00│C01│C02│
+M=128   ├───┼───┼───┤       4 × 3 = 12 output tiles
+        │C10│C11│C12│       Each tile: 32 × 32 elements of C
+        ├───┼───┼───┤
+        │C20│C21│C22│
+        ├───┼───┼───┤
+        │C30│C31│C32│
+        └───┴───┴───┘
+``` -->
+
+![Tiling the output matrix](images2/output_tiling.png)
+
+*Figure: Tiling of output matrix where each tile can be computed independently using a slab of matrix A and matrix B*
+
+For now, assume M and N are exact multiples of the tile sizes. Tail tiles (`M % M_blk`, `N % N_blk`) come later.
+
+### Each tile is an independent sub-problem
+
+Here's the key property: **every output tile is computed from exactly one pair of input slabs** — one from A, one from B.
+
+- The tile at row-block `i`, column-block `j` of C needs:
+  - `A_slab_i` — rows `i·M_blk … (i+1)·M_blk` of A (shape `M_blk × K`)
+  - `B_slab_j` — rows `j·N_blk … (j+1)·N_blk` of B (shape `N_blk × K`, since B is stored as N×K transposed)
+- No other part of A or B is touched by this tile.
+- No other output tile needs both of these slabs simultaneously.
+
+<!-- ```
+                   B (N × K, transposed)
+                 ┌────────────────────┐
+                 │   B_slab_0 (N_blk rows)
+                 ├────────────────────┤
+                 │   B_slab_1
+                 ├────────────────────┤
+                 │   B_slab_2
+                 └────────────────────┘
+                           ▲
+                           │
+       A (M × K)           │           C (M × N)
+   ┌───────────────┐       │       ┌───┬───┬───┐
+   │ A_slab_0      │───────┘───────│C00│C01│C02│
+   ├───────────────┤               ├───┼───┼───┤
+   │ A_slab_1      │───────────────│C10│C11│C12│
+   ├───────────────┤               ├───┼───┼───┤
+   │ A_slab_2      │───────────────│C20│C21│C22│
+   ├───────────────┤               ├───┼───┼───┤
+   │ A_slab_3      │───────────────│C30│C31│C32│
+   └───────────────┘               └───┴───┴───┘
+
+   Tile C_ij = A_slab_i  ×  B_slab_j^T
+``` -->
+
+
+![Output tiling where each c tile is obtained using a specific pair of a A_slab and B_slab](images2/tiled_accumulation.png)
+
+*Figure: A output tiling pattern. Matrix A is broken into horizontal slabs, B (transposed) into horizontal slabs, C into the M_blk × N_blk tile grid. C_ij is computed using slab i from A and slab j from B*
+Conceptually, computing C is just iterating this pairing over all (i, j):
+
+```cpp
+for (int i = 0; i < M / M_blk; ++i) {       // which A-slab
+    for (int j = 0; j < N / N_blk; ++j) {   // which B-slab
+        // C_ij = A_slab_i × B_slab_j^T
+        compute_tile(A_slab_i, B_slab_j, C_ij);
+    }
+}
+```
+
+Two loops over tiles, a slab of A and a slab of B per tile, one block of C produced. Every tile is independent of every other tile — the only shared thing between tiles is the input data they read (many tiles reuse the same A_slab_i, many reuse the same B_slab_j), which is exactly the property we'll exploit later for parallelism and caching.
+
+This is the skeleton the rest of the post builds on. What we haven't specified yet:
+
+- **How `compute_tile` actually does the math.** It has to reduce over the full K dimension (up to thousands of elements) — too large to process in one register sweep. That forces us to split the slabs along K and *accumulate*, which is the setup for BRGeMM's batch-reduce pattern in the next step.
+- Everything else (parallelism, packing, caching, autotuning) comes after.
+
+---
+
+## Step 2: K-Tiling and Batch-Reduce Dispatch
+
+Step 1 left `compute_tile(A_slab_i, B_slab_j, C_ij)` as a black box. Let's open it.
+
+Inside a single output tile, we have to compute
+
+$$C_{ij} = A_{\text{slab}_i} \times B_{\text{slab}_j}^T$$
+
+which is itself a small GEMM: `(M_blk × K) × (K × N_blk) → (M_blk × N_blk)`. K here is the full K dimension of the original problem — in LLM shapes, this can easily be 3072, 4608, 15360. Far too large to multiply in a single register sweep.
+
+### Splitting K into chunks
+
+Introduce a third tile size:
+
+- `K_blk` — K-chunk width (e.g., 32 for BF16)
+
+Now each slab is itself sliced along K into `K / K_blk` chunks. A_slab_i becomes a horizontal sequence of `M_blk × K_blk` chunks; B_slab_j becomes a horizontal sequence of `N_blk × K_blk` chunks. The tile computation becomes a sum over these chunks:
+
+$$C_{ij} = \sum_{b=0}^{K/K_{\text{blk}} - 1} A_{\text{slab}_i}[:, b] \times B_{\text{slab}_j}[:, b]^T$$
+
+Each term in the sum is a tiny matrix multiply with fixed dimensions `(M_blk × K_blk) × (K_blk × N_blk)` — a shape small enough to sit in registers and map cleanly onto hardware tile/FMA units. The outer sum accumulates these into the one `M_blk × N_blk` output tile.
+
+This is exactly the pattern BRGeMM is built for.
+
+### BRGeMM: one call per output tile
+
+BRGeMM's job description:
+
+> Given a batch of `b` small matrix multiplies with identical shapes, compute them all and sum-reduce the results into one output tile.
+
+That's the inner loop, verbatim. So for each output tile we don't loop over K-chunks ourselves — we hand BRGeMM the *batch* of `K / K_blk` chunk pairs and let it do the full reduction in one JIT-compiled kernel call.
+
+```cpp
+// Build once per tile shape: a batch-reduce kernel.
+brgemm brg = brgemm(
+    M_blk, N_blk, K_blk,
+    /* batch_size = */ K / K_blk,    // reduce the whole K dimension
+    /* lda = */ K,                   // A is row-major M × K
+    /* ldb = */ K,                   // B is row-major N × K (transposed)
+    /* ldc = */ N,                   // C is row-major M × N
+    a_dt, b_dt, c_dt,
+    /* is_transposed = */ true);
+brg.set_add_C(false);                // overwrite the tile on first (= only) write
+brg.finalize();
+brg.generate();                      // JIT-compile for this exact shape
+```
+
+The kernel object is per-*shape*, not per-tile — every (i, j) tile in the grid has identical `(M_blk, N_blk, K_blk, batch_size)`, so one `brg` object handles all of them.
+
+One small hardware detail before the kernel runs: on AMX, every thread that issues `tileloadd` / `tdpbf16ps` / `tdpbssd` has to first configure its **tile palette** — an 8-register-wide description of tile shapes (rows, column-bytes per row) via the `ldtilecfg` instruction. BRGeMM wraps this as `brg.set_hw_context()`; call it once per thread before the thread starts executing kernels and the setting sticks until another `set_hw_context` or an explicit `tilerelease`. Every thread in our pool does this lazily on its first kernel call.
+
+### Telling BRGeMM where the chunks are
+
+BRGeMM doesn't take a pointer array for its batch. It takes a table of (A_offset, B_offset) byte offsets — one entry per batch element — relative to the base A/B pointers passed at call time:
+
+```cpp
+std::vector<std::pair<memory::dim, memory::dim>> offsets(K / K_blk);
+for (int b = 0; b < K / K_blk; ++b) {
+    offsets[b] = {
+        b * K_blk * sizeof(dtype),   // step along A's K axis
+        b * K_blk * sizeof(dtype)    // step along B's K axis
+    };
+}
+```
+
+This table is built once and reused for every tile — only the *base* pointers change from one tile to the next.
+
+### The dispatch loop
+
+Putting it together, the whole computation is the Step 1 loop with `compute_tile` replaced by a single BRGeMM call:
+
+```cpp
+for (int i = 0; i < M / M_blk; ++i) {
+    for (int j = 0; j < N / N_blk; ++j) {
+        const auto* A_slab = A + i * M_blk * K;        // A_slab_i base
+        const auto* B_slab = B + j * N_blk * K;        // B_slab_j base
+              auto* C_tile = C + i * M_blk * N
+                               + j * N_blk;           // top-left of C_ij
+
+        brg.execute(A_slab, B_slab, offsets, C_tile, scratchpad);
+    }
+}
+```
+
+One kernel, one offset table, two loops, one BRGeMM call per output tile. This is a complete, correct GEMM.
+
+## Step 3: Parallel Dispatch
+
+### Why parallelize
+
+Modern server-grade processors have dozens to hundreds of cores. An Intel Xeon 6776P ([Granite Rapids](https://www.intel.com/content/www/us/en/products/sku/243691/intel-xeon-6776p-processor-336m-cache-2-30-ghz/specifications.html)) has 64 cores per socket; with Sub-NUMA Clustering enabled, that socket splits into two NUMA nodes of 32 cores each (cores 0–31 on node 0, cores 32–63 on node 1). Step 2's loop pins one of those cores at 100% and leaves the rest idle — for realistic LLM shapes that is leaving >30× of arithmetic throughput on the floor.
+
+Fortunately, the geometry from Step 1 already told us parallelism is free: **every output tile `C_ij` is computed from exactly one pair of slabs `(A_slab_i, B_slab_j)`, and no two tiles write the same output**. There is no data dependency between tiles. They can all run at once, on different cores, and the result is bit-for-bit identical to the serial dispatch.
+
+We use [Threading Building Blocks (TBB)](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onetbb.html) to drive the parallelism. The choice of TBB specifically is detail — any task parallel framework (OpenMP, a raw thread pool) would serve. What matters is that we get a work-stealing scheduler and a way to express "run this body over this index range."
+
+### How: start with a flat pool of work units
+
+The most literal thing we can do is treat **every output tile as one independent work unit** and hand the whole grid to TBB:
+
+```cpp
+const int M_tiles = M / M_blk;
+const int N_tiles = N / N_blk;
+const int total_tiles = M_tiles * N_tiles;
+
+tbb::parallel_for(0, total_tiles, [&](int t) {
+    int i = t / N_tiles;                          // which A-slab
+    int j = t % N_tiles;                          // which B-slab
+
+    const auto* A_slab = A + i * M_blk * K;
+    const auto* B_slab = B + j * N_blk * K;
+          auto* C_tile = C + i * M_blk * N
+                           + j * N_blk;
+
+    brg.execute(A_slab, B_slab, offsets, C_tile, scratchpad);
+});
+```
+
+That's already a correct parallel GEMM. TBB creates a pool of worker threads (one per core by default), walks the `[0, total_tiles)` range, and hands each index to whichever worker is free. Step 2's single `brg.execute` call per tile is unchanged — we've only replaced the outer two-loop walk with a parallel one.
+
+### Rethinking work-unit assignment for data reuse
+
+Correctness is solved. Throughput is not.
+
+With the flat scheme above, TBB's scheduler is free to give thread 0 tile `(0, 0)`, then tile `(2, 7)`, then tile `(1, 3)`. Each of those tiles reads a *different* A_slab and a *different* B_slab. In the worst case, every successive tile a thread processes touches completely disjoint A and B data, and every tile starts cold on the cache hierarchy. The packed-B blobs, the A rows, the JIT scratchpad — all re-fetched from L3 or DRAM.
+
+Look at the slab picture again:
+
+```
+    A (M × K)                    B (N × K, transposed)
+ ┌─────────────┐                ┌────────────────────┐
+ │ A_slab_0    │                │   B_slab_0         │
+ ├─────────────┤                ├────────────────────┤
+ │ A_slab_1    │                │   B_slab_1         │
+ ├─────────────┤                ├────────────────────┤
+ │ A_slab_2    │                │   B_slab_2         │
+ └─────────────┘                └────────────────────┘
+```
+
+Row `i` of the tile grid is the set of all tiles `{C_i0, C_i1, C_i2, …}`. Every tile in that row reads the **same** A_slab_i. Column `j` of the grid is `{C_0j, C_1j, C_2j, …}`: every tile in that column reads the **same** B_slab_j. That is the reuse structure we want to preserve: a thread that processes a contiguous *strip* of tiles sees one of the two slabs repeat for every tile in the strip, so that slab stays hot in L1/L2 across the whole strip.
+
+Concretely, instead of flattening the grid into `total_tiles` independent units, we give each thread a **contiguous slice of one axis** and let it sweep the other axis itself. Assigning along N, for example:
+
+```cpp
+tbb::parallel_for(
+    tbb::blocked_range<int>(0, N_tiles),
+    [&](const tbb::blocked_range<int>& r) {
+        for (int j = r.begin(); j < r.end(); ++j) {   // my N-strip
+            for (int i = 0; i < M_tiles; ++i) {       // sweep all of M
+                const auto* A_slab = A + i * M_blk * K;
+                const auto* B_slab = B + j * N_blk * K;
+                      auto* C_tile = C + i * M_blk * N
+                                       + j * N_blk;
+                brg.execute(A_slab, B_slab, offsets, C_tile, scratchpad);
+            }
+        }
+    });
+```
+
+Now thread `t` owns a contiguous N-strip `[j_start, j_end)` for the entire call. Inside its strip, it walks M from top to bottom. Two things happen:
+
+- **B_slab_j stays hot while the thread works on column j.** Every M-tile in column j reuses that B_slab, so after the first tile in the column it's already in cache.
+- **Different threads touch disjoint B_slabs.** No false sharing on reads, no cache-line ping-pong between cores.
+
+The symmetric choice — partition along M, each thread sweeps its M-strip over all of N — is equally valid and just flips which slab stays hot. Which axis to partition depends on the shape (how many tiles there are on each side, and which of A or B is bigger and more expensive to fetch). That's a heuristics question and a Step 8 problem; for now, picking either one is a strict improvement over the flat layout.
+
+---
+
+## Step 4: B-Packing
+
+Step 3 supplies every BRGeMM call with a sequence of tiles from `A_slab` and `B_slab`, and an offset table, and the JIT kernel produces the output tile. Before we can run it on `bf16` or `int8` data on x86-64, we have to satisfy one concrete data-layout requirement on the tiles of B. The requirement is expressed through `dnnl::ukernel::pack_type` and can be queried from `dnnl::ukernel::brgemm::get_B_pack_type`. If the query returns `dnnl::ukernel::pack_type::no_trans`, no packing is required. Otherwise the caller is responsible for packing B appropriately before calling `brgemm::execute`, either with custom code or with the dedicated `transform` API we'll use below.
+
+```cpp
+auto pack = brgemm::get_B_pack_type(a_dt, b_dt);
+//  b_dt ∈ {bf16, s8, u8}  →  pack_type::trans     (VNNI pack required)
+//  b_dt == f32            →  pack_type::no_trans  (raw row-major OK)
+```
+
+The rule under the hood is a straight dtype check: `{bf16, s8, u8}` require packing, `f32` does not. Nothing shape- or cache-aware. The requirement itself comes from AMX's dot-product instructions. `tdpbf16ps` (bf16) and `tdpbssd`/`tdpbusd` (int8) accept their B operand only in **VNNI** layout inside the tile register — pairs of bf16 rows (or quads of int8 rows) interleaved lane-wise so the systolic array sees its inputs in dot-product order.
+
+That lane order is not arbitrary. The same ordering that satisfies the compute unit is, by construction, the one where the entire `K_blk × N_blk` block is a **single contiguous run of `K_blk · N_blk · sizeof(b_dt)` bytes** in memory. Two perspectives on one layout: the compute side calls it "VNNI lane order"; the memory side calls it "contiguous streamable block."
+
+Contrast raw row-major B. The `K_blk × N_blk` block is N_blk rows of K_blk contiguous elements, separated by a stride of K between block rows. For K=4608 in bf16 that stride is ~9 KB — each block row starts in a fresh cache line and often a fresh TLB page, and the hardware prefetchers can't stream across them. That's N_blk independent strided loads per block, per batch element. That's the access pattern the VNNI requirement rules out: rather than tolerate the slow layout and rely on the programmer to avoid it, the bf16/int8 instructions refuse anything except the fast one.
+
+(For f32 there's no dot-product-level constraint, so raw row-major B is accepted and no pack is needed.)
+
+To make the difference concrete, take `K_blk = 4`, `N_blk = 4`, `K = 12`. Name each element `nXkY` = `B[X, Y]`. One `K_blk × N_blk` block is 16 bf16 values — 32 bytes.
+
+Raw row-major B (each row stretches across the full K; the block lives in the first four columns of the first four rows):
+
+```
+    memory address →
+
+    row n=0 :  [n0k0][n0k1][n0k2][n0k3] [n0k4][n0k5] ... [n0k11]
+    row n=1 :  [n1k0][n1k1][n1k2][n1k3] [n1k4][n1k5] ... [n1k11]
+    row n=2 :  [n2k0][n2k1][n2k2][n2k3] [n2k4][n2k5] ... [n2k11]
+    row n=3 :  [n3k0][n3k1][n3k2][n3k3] [n3k4][n3k5] ... [n3k11]
+
+    ├─── block ────┤└──── stride K - K_blk (8 elements) ────┘
+      (8 bytes)          (skip before next block-row starts)
+```
+
+Four disjoint 8-byte spans, separated by stride K. Four strided loads per block, each starting a new cache line. Also: the pairs of adjacent k-values the dot-product unit wants `((n0k0, n0k1), (n1k0, n1k1), …)` are spread across four rows in memory, not in the lane order the tile register expects.
+
+Packed B, same block laid out contiguously, K-pair-major with N interleaved inside each pair:
+
+```
+    memory address →    (single contiguous 32-byte run)
+
+    tile row 0  —  K-pair (k=0, k=1):
+      [n0k0 n0k1] [n1k0 n1k1] [n2k0 n2k1] [n3k0 n3k1]
+       ↑ lane 0    ↑ lane 1    ↑ lane 2    ↑ lane 3
+
+    tile row 1  —  K-pair (k=2, k=3):
+      [n0k2 n0k3] [n1k2 n1k3] [n2k2 n2k3] [n3k2 n3k3]
+       ↑ lane 0    ↑ lane 1    ↑ lane 2    ↑ lane 3
+```
+
+The same 16 elements, in the order the hardware dot-product wants to consume them. One `tileloadd` fetches the whole block as a single streamed run — no strided gather, no per-use shuffle. Every subsequent `K_blk × N_blk` block in the packed buffer follows immediately after, so walking the K-axis inside a super-block is just advancing a pointer by `block_size` bytes.
+
+<!-- FIGURE: b-packing-layout.svg — SVG rendition of the ASCII above. Left: raw N×K row-major B with a K_blk × N_blk block highlighted, arrows showing the N_blk strided loads at stride K. Right: VNNI-packed buffer with the same block as a single contiguous run; arrows collapsed into one streamed fetch. Label each element (nXkY) so the motion from raw to packed is traceable. -->
+
+### How: oneDNN's `transform` primitive
+We can implement this packing step as a separate JIT-compiled OneDNN primitive, `transform`, that mirrors the BRGeMM interface: describe the shape, call `generate()`, then `.execute()` against a source and destination buffer. One `transform` object per (K-range, N-tile-width) shape handles all the stride arithmetic and VNNI interleaving internally.
+
+```cpp
+// Ask oneDNN what packing B needs for this (A_dtype, B_dtype) pair.
+//   - AMX bf16/int8  → pack_type::trans  (transpose + VNNI reblock)
+//   - scalar f32     → pack_type::no_trans
+auto pack = brgemm::get_B_pack_type(a_dt, b_dt);
+
+// Build a JIT packer for a single N-tile-wide strip of B, full K.
+transform pack_B = transform(
+    /* rows (K)       = */ K,
+    /* cols (N_blk)   = */ N_blk,
+    /* pack kind      = */ pack_type::trans,
+    /* src ld (stride)= */ K,         // raw B row stride (N×K row-major)
+    /* dst ld         = */ N_blk,     // packed stride: N_blk wide blocks
+    /* src dt         = */ b_dt,
+    /* dst dt         = */ b_dt);
+pack_B.generate();
+```
+
+Execute it once per B_slab (once per `j` in the tile grid), writing into a dedicated `B_packed` buffer:
+
+```cpp
+// One packed destination buffer for all of B.
+std::vector<uint8_t> B_packed(N * K * sizeof(b_dt));
+
+for (int j = 0; j < N_tiles; ++j) {
+    const auto* B_src  = B              + j * N_blk * K;                   // raw B_slab
+          auto* B_dest = B_packed.data() + j * (K * N_blk * sizeof(b_dt)); // packed slab
+
+    pack_B.execute(B_src, B_dest);
+}
+```
+
+Inside each packed slab, the `K_blk × N_blk` blocks the micro-kernel will ask for are laid out consecutively — block 0 followed by block 1 followed by block 2. Reading block `b` is a single contiguous fetch instead of `N_blk` strided ones.
+
+### Allocating the packed buffer: hugepages
+
+A plain `std::vector<uint8_t>` will work, but it's the wrong allocator for this buffer. Here's why, and what to replace it with.
+
+The packed B buffer is large. For a single Gemma FFN layer with K=4608, N=36864, BF16, it's 324 MB. For int8 it's 162 MB. Either way, vastly bigger than the CPU's per-core L1/L2 caches and a significant chunk of the L3.
+
+Large buffers interact poorly with the default 4 KB page size. The TLB — the small on-core cache of virtual-to-physical page translations — has a fixed number of entries (typically 64 L1 entries and ~1500 L2 entries on recent Xeons). With 4 KB pages, 1500 TLB entries cover about 6 MB of memory. A 300 MB packed-B buffer blows past that by 50×, so during the inner kernel loop the micro-kernel is constantly taking TLB misses: fetch the packed block → miss the TLB → walk the page table → finally fetch the data. Each TLB miss costs tens to hundreds of cycles and is serialized with the demand load that triggered it.
+
+2 MB hugepages are the fix. One hugepage entry in the TLB covers 512× more address space than a 4 KB entry. 1500 L2 TLB entries × 2 MB = ~3 GB of coverage — plenty for any weight matrix we'll hit — so TLB misses on the packed buffer become a rounding error.
+
+On Linux, there are two ways to get hugepages into a buffer:
+
+1. `MAP_HUGETLB` on `mmap`. Requires the admin to reserve hugepages in `/proc/sys/vm/nr_hugepages` ahead of time, and fails outright if none are available.
+2. `madvise(ptr, len, MADV_HUGEPAGE)` on an anonymous `mmap`. Lets the kernel's *transparent hugepage* subsystem promote the region to 2 MB pages when it can, and silently fall back to 4 KB pages when it can't.
+
+We use option 2. It's permissionless and never a hard failure. The library wraps it in a small RAII buffer:
+
+```cpp
+// Distilled from HugePageBuffer in gemm.h
+struct HugePageBuffer {
+  void resize(size_t n) {
+    // Round up to the hugepage boundary so the whole allocation is eligible.
+    static constexpr size_t kHuge = 1u << 21;   // 2 MB
+    size_ = (n + kHuge - 1) & ~(kHuge - 1);
+    ptr_  = static_cast<uint8_t*>(
+        mmap(nullptr, size_, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    madvise(ptr_, size_, MADV_HUGEPAGE);
+
+    // Touch one byte per hugepage so the kernel actually promotes the mapping
+    // at resize() time instead of lazily on first access (which would drag a
+    // page-fault storm into the hot path on the first call).
+    for (size_t off = 0; off < size_; off += kHuge)
+      static_cast<volatile uint8_t*>(ptr_)[off] = 0;
+  }
+  // ... move-only, munmap in destructor, data()/size() accessors omitted.
+ private:
+  uint8_t* ptr_ = nullptr;
+  size_t   size_ = 0;
+};
+```
+
+Three details worth knowing:
+
+- **Round up to a hugepage boundary.** A mapping whose length isn't a multiple of 2 MB may or may not get promoted, depending on the kernel's THP heuristics. Rounding up removes the doubt.
+- **Pre-fault the pages.** Fresh anonymous mappings are zero-filled lazily — the pages don't actually exist in memory until the first store touches them. If we skip the one-byte-per-page write in `resize()`, the first GEMM call eats hundreds of page faults (and THP promotion decisions) while the worker threads are trying to run.
+- **Fallback is silent.** If the system is out of hugepages or THP is disabled, `madvise` returns success and the mapping stays on 4 KB pages. The code still runs, just with the old TLB-miss rate. No need to special-case anything.
+
+Swap `std::vector` for `HugePageBuffer` and the rest of Step 4 is unchanged:
+
+```cpp
+HugePageBuffer B_packed;
+B_packed.resize(N * K * sizeof(b_dt));
+
+for (int j = 0; j < N_tiles; ++j) {
+    const auto* B_src  = B                 + j * N_blk * K;
+          auto* B_dest = B_packed.data()   + j * (K * N_blk * sizeof(b_dt));
+    pack_B.execute(B_src, B_dest);
+}
+```
+
+(This buffer becomes even more valuable in Step 8, where we cache it across calls — at that point the pack runs once at model load and the hugepage-backed buffer stays hot for every forward pass.)
+
+### The B offsets need to change
+
+BRGeMM itself doesn't care whether B is raw or packed — it consumes whatever layout we describe. What it *does* need is an offset table whose B-strides match the layout in memory. Step 2's offsets were built against raw row-major B; after packing we have to rebuild them against the packed layout, or the kernel will read garbage.
+
+The difference is just the B-side stride between successive batch elements:
+
+```cpp
+// Step 2 — raw row-major B: step K_blk elements along a row of B.
+offsets[b] = { b * K_blk * sizeof(a_dt),
+               b * K_blk * sizeof(b_dt) };
+
+// Step 4 — packed B: successive K-chunks of a slab are successive
+//                    contiguous K_blk × N_blk blocks.
+const size_t block_size = K_blk * N_blk * sizeof(b_dt);
+offsets[b] = { b * K_blk * sizeof(a_dt),    // A unchanged
+               b * block_size };            // B now block-stride
+```
+
+A's offsets are untouched — A wasn't repacked. Only the B side moves from row-stride (`K_blk · sizeof(b_dt)`) to block-stride (`K_blk · N_blk · sizeof(b_dt)`).
+
+### Feeding the packed buffer to BRGeMM
+
+With the packed buffer built and the offset table rebuilt, the dispatch loop is the same as Step 3 — just with the B base pointer retargeted to `B_packed`:
+
+```cpp
+tbb::parallel_for(
+    tbb::blocked_range<int>(0, N_tiles),
+    [&](const tbb::blocked_range<int>& r) {
+        for (int j = r.begin(); j < r.end(); ++j) {
+            const auto* B_slab = B_packed.data() + j * (K * N_blk * sizeof(b_dt));
+            for (int i = 0; i < M_tiles; ++i) {
+                const auto* A_slab = A + i * M_blk * K;
+                      auto* C_tile = C + i * M_blk * N + j * N_blk;
+                brg.execute(A_slab, B_slab, offsets, C_tile, scratchpad);
+            }
+        }
+    });
+```
+
+Same two loops, same one BRGeMM call per tile, same thread-per-N-strip partition. The only moving parts are: (1) B went through the packer once before the loop, (2) the B_offset stride in the table changed from row-stride to block-stride.
+
+---
+
+## Step 5: K-Super-Blocking
+
+So far, our BRGeMM call batches *all* K-blocks for given `A_slab` and `B_slab` together. But when the K dimension gets very large, the A and B tiles for all K-blocks of a given (M-tile, N-tile) pair no longer fit in L2 cache. Once the working set spills to L3 or main memory, the micro-kernel stalls on data fetches and performance drops sharply — the CPU's compute units sit idle waiting for data that used to arrive in ~10 cycles (L2) but now takes 40+ cycles (L3) or 200+ cycles (DRAM).
+
+K-super-blocking solves this by splitting the K-reduction into smaller super-blocks, each sized so that its A and B slices stay resident in L2 throughout the batch-reduce. The number of K-blocks on given super block determines the `batch_size` for our individual brgemm kernel. The trick is to find a sweet spot: large enough to amortize kernel launch overhead, small enough to keep the working set in L2.
+
+![k-super-blocking](images2/super_blocking.png)
+*Figure: K-super-blocking, where K axis is divided into K_chunks of K_blk each, grouped into super-blocks of batch_size chunks.*
+
+## Step 6: Tiling Revisited
+
+So far we've quietly assumed three things: M is a multiple of `M_blk`, N is a multiple of `N_blk`, and the K-super split in Step 5 leaves no leftover. On a toy problem that's fine. On real LLM shapes — e.g., M=128, K=4608, N=24576 with `(M_blk, N_blk, K_blk) = (32, 32, 32)` and `K_super_size = 64` — every assumption can break somewhere.
+
+This section folds all three loose ends into the dispatch.
+
+### Three kinds of tail
+
+Going from least to most subtle:
+
+- **M-tail.** If `M % M_blk ≠ 0`, the bottom row of output tiles is shorter than `M_blk`. Its kernel needs a smaller tile height (and a smaller BRGeMM object — the tile height is baked into the JIT).
+- **N-tail.** Same story along N: the rightmost column of tiles is narrower than `N_blk`.
+- **K-tail.** `K_tail = K % K_blk`. The K-reduction doesn't land on a clean K-chunk boundary; a sliver of width `K_tail < K_blk` remains after `K_chunks = K / K_blk` full chunks. Step 5's super-block math works only over those `K_chunks` full chunks; the K-tail is a separate, final BRGeMM call of batch size 1 and width `K_tail`.
+- **K-super remainder.** `K_super_rem = K_chunks % K_super_size`. Even without a K-tail, the full K-chunks may not divide evenly into super-blocks. The last super-block covers only `K_super_rem` chunks instead of `K_super_size`.
+
+M- and N-tails are about tile *shape*. K-tail and K-super remainder are about tile *batching*. Each forces a separate JIT-compiled kernel — BRGeMM specialises a new kernel per `(M_blk, N_blk, K_blk, batch_size, add_C)` tuple, and every tail changes one of those dimensions.
+
+### The five K-batching variants
+
+For a given (tile shape), the K-reduction now looks like:
+
+```
+super-block 0 ── brg_first_all (batch = K_super_size, add_C = false, writes temp_C)
+super-block 1 ── brg_full      (batch = K_super_size, add_C = true,  accumulates)
+  ...
+super-block n-1 ── brg_full    (same)
+super-block n  ── brg_rem      (batch = K_super_rem,  add_C = true,  accumulates)
+K-tail slice   ── brg_ktail    (batch = 1,            add_C = true,  accumulates)
+```
+
+That already gives four variants. The fifth covers the corner case where `K_super_blocks == 0` — i.e., `K_chunks < K_super_size`, so the whole K-reduction *is* the remainder. In that situation the remainder super-block is the first thing we run, so it must overwrite rather than accumulate:
+
+| Kernel | Batch Size | `add_C` | When Used |
+|---|---|---|---|
+| `brg_first_all` | `K_super_size` | false | First K-super-block (overwrites temp_C) |
+| `brg_full` | `K_super_size` | true | Subsequent full K-super-blocks (accumulate) |
+| `brg_first_rem` | `K_super_rem` | false | Remainder K-super-block when it's the only one |
+| `brg_rem` | `K_super_rem` | true | Remainder K-super-block after at least one full one |
+| `brg_ktail` | 1 | depends | Final `K % K_blk` slice (overwrites if nothing preceded it, else accumulates) |
+
+Each variant is a separately JIT-compiled BRGeMM object. They share `M_blk`, `N_blk`, the A/B/C dtypes, and the leading dimensions; they differ only in batch size and `add_C`.
+
+### Building all the kernels
+
+M- and N-tails multiply the count: every K-batching variant needs up to four tile-shape specializations — `(full, full)`, `(full, N_tail)`, `(M_tail, full)`, `(M_tail, N_tail)`. We index the two axes as `mi ∈ {0, 1}` and `ni ∈ {0, 1}` with 0 = full and 1 = tail:
+
+```cpp
+brgemm brg_first_all [2][2];
+brgemm brg_full      [2][2];
+brgemm brg_first_rem [2][2];
+brgemm brg_rem       [2][2];
+brgemm brg_ktail     [2][2];
+```
+
+Upper bound: 5 × 2 × 2 = **20 JIT kernels per (shape, config)**. In practice, shapes with no tail skip the `[1][*]` or `[*][1]` slots, and configs where `K_super_blocks ≤ 1` skip `brg_full` or `brg_first_rem`, so the real count is usually 4–12.
+
+The build loop walks every (mi, ni) that has work, picks the right `(tile_m, tile_n)` pair, and hands each variant to `MakeBrgemm`:
+
+```cpp
+for (int mi = 0; mi < 2; ++mi) {
+    for (int ni = 0; ni < 2; ++ni) {
+        if (mi == 1 && M_tail == 0) continue;       // no M-tail on this shape
+        if (ni == 1 && N_tail == 0) continue;       // no N-tail
+
+        const auto tile_m = (mi == 0) ? M_blk : M_tail;
+        const auto tile_n = (ni == 0) ? N_blk : N_tail;
+
+        if (K_chunks > 0)
+            MakeBrgemm(brg_first_all[mi][ni], tile_m, tile_n, K_blk,
+                       K_super_size, /*add_C=*/false, ...);
+        if (K_super_blocks > 1)
+            MakeBrgemm(brg_full[mi][ni],      tile_m, tile_n, K_blk,
+                       K_super_size, /*add_C=*/true,  ...);
+        if (K_super_rem > 0) {
+            const bool rem_is_first = (K_super_blocks == 0);
+            MakeBrgemm(rem_is_first ? brg_first_rem[mi][ni]
+                                    : brg_rem[mi][ni],
+                       tile_m, tile_n, K_blk,
+                       K_super_rem, /*add_C=*/!rem_is_first, ...);
+        }
+        if (K_tail > 0)
+            MakeBrgemm(brg_ktail[mi][ni], tile_m, tile_n, K_tail, /*batch=*/1,
+                       /*add_C=*/(K_chunks > 0), ...);
+    }
+}
+```
+
+`MakeBrgemm` is the Step 2 constructor + `set_add_C` + `finalize` + `generate` sequence, wrapped for brevity.
+
+### Offset tables, revisited
+
+From Steps 2 and 4 we know every BRGeMM call needs an `(A_offset, B_offset)` table sized to its batch: A-offsets step through A by raw row stride, B-offsets step through packed B by block stride. With multiple K-batching variants, we now need one table *per variant*:
+
+- `offsets_first_all[ni]` — length `K_super_size`, covering K-chunks 0..K_super_size-1 (the first super-block).
+- `offsets_full[ni][ks]` — length `K_super_size`, one per `ks ∈ [1, K_super_blocks)`, with offsets shifted so the batch covers K-chunks of super-block `ks`.
+- `offsets_rem[ni]` — length `K_super_rem`, covering the remainder super-block's K-chunks.
+- `offsets_ktail[ni]` — length 1, covering the K-tail slice.
+
+The `[ni]` index matters because a B-tail column has a smaller packed block size (`K_blk × N_tail` instead of `K_blk × N_blk`), so its block stride is different. A-offsets are identical across `ni`.
+
+All of these are built once when the kernel entry is constructed — offsets don't depend on the actual data pointers, only on dtype sizes and layout strides.
+
+### Executing one tile
+
+For a given output tile at `(m_tile_idx, n_tile_idx)`, the dispatch walks the K-super-blocks in order, picks the right variant at each step, and finishes with the K-tail:
+
+```cpp
+void execute_tile(int m_tile_idx, int n_tile_idx) {
+    const int mi = (m_tile_idx < M_full_tiles) ? 0 : 1;
+    const int ni = (n_tile_idx < N_full_tiles) ? 0 : 1;
+
+    const auto cur_m = (mi == 0) ? M_blk : M_tail;
+    const auto cur_n = (ni == 0) ? N_blk : N_tail;
+
+    const auto* A_base = A         + m_tile_idx * M_blk * K;          // raw A
+    const auto* B_base = B_packed  + n_tile_idx * K * N_blk * sizeof(b_dt);
+    float*      temp_C = tls.temp_C;                                  // thread-local, contiguous, M_blk × N_blk
+
+    // K-super walk
+    if (K_super_blocks > 0) {
+        brg_first_all[mi][ni].execute(A_base, B_base,
+                                      offsets_first_all[ni],
+                                      temp_C, tls.scratch);
+        for (int ks = 1; ks < K_super_blocks; ++ks)
+            brg_full[mi][ni].execute(A_base, B_base,
+                                     offsets_full[ni][ks - 1],
+                                     temp_C, tls.scratch);
+        if (K_super_rem > 0)
+            brg_rem[mi][ni].execute(A_base, B_base,
+                                    offsets_rem[ni],
+                                    temp_C, tls.scratch);
+    } else if (K_super_rem > 0) {
+        brg_first_rem[mi][ni].execute(A_base, B_base,
+                                      offsets_rem[ni],
+                                      temp_C, tls.scratch);
+    }
+
+    // K-tail
+    if (K_tail > 0)
+        brg_ktail[mi][ni].execute(A_base, B_base,
+                                  offsets_ktail[ni],
+                                  temp_C, tls.scratch);
+
+    // Scale and scatter the dense tile into strided output C
+    float* C_tile = C + m_tile_idx * M_blk * N + n_tile_idx * N_blk;
+    for (int m = 0; m < cur_m; ++m)
+        for (int n = 0; n < cur_n; ++n)
+            C_tile[m * N + n] = temp_C[m * cur_n + n] * scale;
+}
+```
+
+Two details worth spelling out:
+
+- **`temp_C` is a thread-local, contiguous buffer.** The BRGeMM calls write into `temp_C` with `ldc = cur_n` (a dense tile), not into the output with `ldc = N` (a strided slab). This keeps the inner writes cache-line-aligned and lets the kernel emit its tightest store sequence. Only the final copy — one tile, once — pays the strided-write cost.
+- **Scaling and dtype conversion happen in the final copy.** For BF16 and INT8, the accumulator is FP32 / INT32; applying `scale` and converting to the FP32 output is cheap compared to the reduce, and it happens exactly once per tile rather than once per K-super-block.
+
+### The full dispatch
+
+Step 3's TBB partition is unchanged — threads still own contiguous N-strips and sweep M inside. The only difference is that the inner body is now `execute_tile` instead of a single `brg.execute`:
+
+```cpp
+tbb::parallel_for(
+    tbb::blocked_range<int>(0, N_total_tiles),  // N_full_tiles + (N_tail ? 1 : 0)
+    [&](const tbb::blocked_range<int>& r) {
+        for (int j = r.begin(); j < r.end(); ++j)
+            for (int i = 0; i < M_total_tiles; ++i)
+                execute_tile(i, j);
+    });
+```
+
+With this, the library is correct on arbitrary (M, K, N) shapes and arbitrary choices of `(M_blk, N_blk, K_blk, K_super_size)`. It just doesn't yet know *which* choice is fastest for a given shape.
+
+### Picking block sizes: a short autotune
+
+Different shapes prefer different `(M_blk, N_blk, K_blk, K_super_size)` tuples — there's no single setting that wins for both tall-thin and flat-wide. Rather than try to predict the winner from a cost model, we do the crudest thing that works: time a handful of candidates for the shape in question and keep the fastest.
+
+The candidate set is small by construction. AMX pins `N_blk` and `K_blk` to hardware-native values (32 for bf16/int8), leaving only `M_blk ∈ {32, 64}` and `K_super_size ∈ {16, 32, 64, 128, 256}` free — ten candidates at most. For fp32 on AVX-512 the situation is similar with 16-wide blocks. We run each candidate on the real input, measure wall time, and over a few rounds prune anything meaningfully slower than the current best. After a handful of calls the search converges and every subsequent call with the same `(M, K, N, dtype)` shape reuses the winner.
+
+That's enough detail for this post. The search is an uninteresting iterative crawl; the interesting questions — richer search spaces, shape-aware warm-starting, cost models — deserve their own post, which is where we'll take them.
+
+---
+
+
+## Step 7: Two-Level Caching
+
+By the end of Step 6, a single call to the library does a lot of one-time work before any arithmetic happens:
+
+- **JIT the kernels.** Up to 20 BRGeMM objects per (shape, config), each `finalize()`d and `generate()`d. The plus side of JIT — codegen tuned to the exact tile shape — is also the cost: every `generate()` runs an assembler. Measured on our test machine, building the full kernel set for one shape takes on the order of tens of milliseconds.
+- **Pack B.** Scan the entire weight matrix and emit a rearranged copy into a hugepage-backed buffer. `O(N · K)` bandwidth, hundreds of MB touched, every call.
+
+Neither of those depends on the actual input data — both are a function of the shape and dtype, not the numbers in A or B. Rerunning them on every GEMM call would make the library unusable in a loop: a transformer forward pass makes thousands of GEMM calls per token, and we'd spend almost all of that time re-JITing and re-packing the same things.
+
+The fix is the boring one: cache both, keyed on exactly what they depend on.
+
+Step 4 already gave us half of this on a per-call basis — the amortization argument for packing B over `M_tiles` reuses inside a single call. The per-call amortization is the floor; the real payoff comes from amortizing over *calls*. For LLM inference, the same shape runs thousands of times with the same weight matrix, so a pack done once at model load feeds billions of subsequent reads. Step 7 is where that promise is actually delivered.
+
+The library maintains two caches inside the `GemmHandle`:
+
+### Kernel Cache
+Keyed by `(M, K, N, M_blk, N_blk, K_blk, batch_size, dtype)`. Each entry holds:
+- the JIT-compiled `brgemm` objects (up to 5 K-batching variants × up to 4 tile-shape combinations = up to 20 kernels),
+- the packing `transform` objects from Step 4,
+- the precomputed offset tables from Step 6,
+- and the scratchpad size required by the kernels.
+
+Note that the key includes both the shape `(M, K, N)` *and* the tuning config `(M_blk, N_blk, K_blk, batch_size)`. During the short autotune from Step 6, the same shape can produce several entries — one per candidate the autotuner tried. After it converges, the winning entry stays hot and the losing ones age out with the handle.
+
+### Packed B Cache
+Keyed by `(B_pointer, K, N, K_blk, N_blk)`. Each entry holds:
+- the hugepage-backed packed B buffer from Step 4,
+- its per-N-tile offset lookup tables,
+- and the K-tail offset tables.
+
+The pointer-valued key is the subtle part. The cache is keyed on **pointer identity** — `reinterpret_cast<uintptr_t>(B_ptr)` — not on the bytes inside B. This is a deliberate trade of safety for speed: hashing the full N × K weight matrix on every call would defeat the point of caching, while a pointer compare is a handful of cycles.
+
+In exchange, the library places a contract on the caller: **as long as a B pointer is live in the cache, the data behind it must not change.** For LLM inference this contract is free — weight matrices are loaded once at model load and never mutated — so the same `B_ptr` can feed thousands of calls per second and hit the cache every time.
+
+When weights *do* change (hot-swapping a LoRA adapter, reloading a model, running a fine-tune step), the caller has to tell the cache to forget, because the pointer alone can't detect that the contents behind it were rewritten. We need to expose `brgemm_gemm_clear_b_cache()` for exactly that reason: drop the entries and let the next call repack.
+
+With both caches in place, a steady-state GEMM call is down to a hashmap lookup for each cache (microseconds) plus the actual arithmetic. Everything the earlier steps introduced — the kernel variants, the packed buffer, the offset tables — is built once, on the first call for a given shape and B pointer, and amortized forever after.
+
+---
+## Step 8: Adaptive 3-way Dispatch
+
+Step 3 committed to one threading strategy: give each thread a contiguous N-strip and let it sweep all of M inside. That strategy has a narrow sweet spot. At the edges it falls over — for two different reasons depending on which edge.
+
+### Where the single strategy breaks
+
+**Edge 1: M is too small.** If `M_total_tiles ≤ 1` — say M=32 and M_blk=32, one tile tall — then "sweep all of M" is a one-tile loop. Each thread still gets a different N-strip and does meaningful work, so this isn't a performance disaster, it's just that the "M-sweep" part of Step 3's strategy reduces to nothing. We take it as-is and keep the N-partition.
+
+**Edge 2: M is small but not that small, and K is deep.** Take a typical decode-time LLM shape: M=128, M_blk=32, so `M_total_tiles = 4`, K=4608 split into `K_super_blocks ≥ 4`. Each thread owns an N-strip of (say) 768 tiles and, for each K-super-block, walks all 4 M-tiles inside that strip. The inner loop order is `for ks: for n_tile: for m_tile`, which means every N-advance re-reads the A-slab for all 4 M-tiles. With deep K, that A-slab keeps cycling through L1/L2 instead of staying hot. On that specific shape class we'd rather split M across threads too, even at the cost of fewer threads seeing N.
+
+**Wide-and-flat shapes.** Enough M-tiles that the inner m-loop is substantial, but not so many that we're wasting parallelism by going 1D on N. This is the common case and the one Step 3 already handles.
+
+### Three regimes
+
+The library picks between three dispatches at call time:
+
+- **1D over N (thin M).** `M_total_tiles ≤ 1`. Partition N across threads; each thread runs its N-strip once, walking K-super-blocks inside. Same structure as Step 3 with the M-loop collapsed to a single iteration.
+- **2D M×N (narrow case).** Partition *both* M and N across threads using a `par_m × par_n` grid with `par_m · par_n ≤ num_threads`. Each thread now owns a small M-range as well as a small N-range, so the inner m-loop shrinks and A stays hot across K-super-blocks.
+- **1D coarse N (default).** Identical to Step 3: partition N across threads, each thread sweeps all M inside. This is the strategy for every shape that isn't the narrow 2D case or the thin-M case.
+
+
+![Thread dispatch patterns](images2/dispatch_patterns.png)
+
+*Figure: Dispatch patterns. (1) 1D over N: the columns of tiled-matrix B are divided evenly among the threads and all of them share entire matrix A (2) 2D M×N: The output matrix is divided into a grid and each thread computes one or more subsections on the grid. Each grid requires some rows of matrix A and some columns of matrix B.*
+Switching between them is a branch at the top of the dispatch. The rest — the `execute_tile` body, the `temp_C` accumulator, thread-local scratch — is shared.
+
+```cpp
+if (M_total_tiles <= 1) {
+    // 1D over N (thin M).
+    parallel_for_balanced(full_n, N_blk, [&](Range n_range) { ... });
+} else if (should_go_2d(M, M_total_tiles, N_total_tiles,
+                       K_super_blocks, num_threads)) {
+    // 2D M×N.
+    parallel_for_2d(ranges_m, ranges_n, [&](Range m_range, Range n_range) { ... });
+} else {
+    // 1D coarse N (default).
+    parallel_for_balanced(full_n, N_blk, [&](Range n_range) { ... });
+}
+```
+
+### The heuristic is crude, and we know it
+
+`should_go_2d` is empirical. The current version is effectively a special-case check for one observed shape family (M=128 decode shapes with multi-super-block K) plus a sanity floor so that after halving the N-task count, each thread still gets enough N-tiles to keep BRGeMM launch overhead amortized:
+
+```cpp
+// Paraphrased from gemm.h
+if (M == 128 && M_total_tiles == 2 && K_super_blocks >= 4) {
+    const size_t n_per_thread_if_2d =
+        N_total_tiles / (num_threads / 2);
+    if (n_per_thread_if_2d >= 4) par_m = 2;
+}
+```
+
+That's it. Every other shape falls through to the 1D-coarse-N default.
+
+Being honest: this rule works for the shapes we've measured but it's neither general nor principled. Real heuristics want to think about L2 capacity, the ratio of A-reload traffic to B-traffic, how K_super_blocks interacts with thread count, and so on. Like the autotune search in Step 6, the *mechanism* is what this post is about — three dispatches wired to a single entry point — and the *policy* deserves its own treatment.
+
+A related knob that shapes the dispatch question: the inner loop order. Inside every thread's work, the library walks `for ks: for n_tile: for m_tile` — m innermost, n middle, k-super-block outermost. With this order, for each k-super-block, each thread walks all its assigned m-tiles under every n-tile in its strip — which means the B_slab for that n-tile stays hot across the full m-walk, and the A-slabs rotate through. Flipping n and m would reverse the reuse pattern: an A-slab would stay hot across an n-walk, and the B-slabs would cycle. We picked m-inner because B, on bf16/int8, is the packed buffer we already paid to rearrange — keeping it hot is the higher-value reuse. That choice bakes in further: once the inner order is set, which outer dimension to *partition* (M vs N across threads) is no longer symmetric, and the `should_go_2d` heuristic is the thing that decides it.
+
+There's also a fourth dispatch the library has tried and shelved: **K-parallel**, where multiple threads split the K-reduction for the same tile and reduce into private partial-C buffers that get summed at the end. The code for it is still sitting under an `#if 0` in `gemm.h` — useful for shapes where M and N are both too small to saturate the thread pool but K is large, and worth mentioning as a signpost for future work.
+
+With 3-way dispatch in, the library is feature-complete: tiling, batch-reduce, parallelism, packing, K-super-blocking, tail handling, autotune, two-level caching, and a shape-aware threading choice on top.
+
+---
+
+## The Complete Public API
+
+```cpp
+#include "gemm.h"
+using namespace brgemm_gemm;
+
+// 1. Create a handle (once, at startup)
+brgemm_gemm_config_t config;
+config.num_threads = 0;      // 0 = TBB default
+config.numa_node = -1;       // -1 = no pinning
+config.autotune_rounds = 4;
+
+brgemm_gemm_handle_t handle = brgemm_gemm_create(&config);
+
+// 2. Execute GEMM: C = A × B^T × scale
+//    A: M×K row-major (bf16)
+//    B: N×K row-major (bf16, transposed)
+//    C: M×N row-major (f32 output)
+brgemm_gemm_execute(handle, A, B, C,
+                    M, K, N, scale, BRGEMM_BF16);
+
+// 3. Cleanup
+brgemm_gemm_destroy(handle);
+```
+
+That's it. Three calls. The library handles kernel JIT compilation, B packing, autotuning, threading, and ISA dispatch internally.
+
+---
+
+## Benchmarking: Gemma-Scale Shapes
+
+The test harness (`gemm_test.cc`) benchmarks the 18 matrix shapes from the Gemma CPP model — realistic LLM workloads:
+
+```cpp
+// M × K × N (B is N×K transposed)
+Shape shapes[] = {
+    {128, 3072,  24576}, {128, 3840,  15360}, {128, 4608,  36864},
+    {128, 15360,  3840}, {128, 24576,  3072}, {128, 36864,  4608},
+    {256, 3072,  24576}, {256, 3840,  15360}, {256, 4608,  36864},
+    {256, 15360,  3840}, {256, 24576,  3072}, {256, 36864,  4608},
+    {512, 3072,  24576}, {512, 3840,  15360}, {512, 4608,  36864},
+    {512, 15360,  3840}, {512, 24576,  3072}, {512, 36864,  4608},
+};
+```
+
+Correctness is verified against a naive triple-loop reference (with BF16 tolerance of <2% relative error):
+
+```cpp
+// Naive reference: C = A × B^T × scale (bf16 → f32)
+for (int64_t m = 0; m < M; m++)
+    for (int64_t n = 0; n < N; n++) {
+        float acc = 0.0f;
+        for (int64_t k = 0; k < K; k++)
+            acc += bf16_to_float(A[m*K + k]) * bf16_to_float(B[n*K + k]);
+        C[m*N + n] = acc * scale;
+    }
+```
+
+Results on an INTEL(R) XEON(R) PLATINUM 8592+ box with AMX, 1 NUMA node, 1000 timed iterations per (shape, dtype) after a 60-iter warmup that absorbs the autotune. GFLOPS are computed as `2·M·K·N / avg_time`.
+
+Here's the machine specification collected using [PerfSpect](https://github.com/intel/PerfSpect). 
+![Test machine specification](images2/machine_specs.png)
+
+*Figure: The specification of test CPUs. it has 4 SNC nodes, the results are from single NUMA node*
+
+| Shape (M × K × N)   | bf16 (GFLOPS) | s8 (GFLOPS) | f32 (GFLOPS) |
+|---|---:|---:|---:|
+| 128 × 3072  × 24576 | 13,590 | 24,369 |   860 |
+| 128 × 3840  × 15360 | 20,529 | 26,153 | 2,160 |
+| 128 × 4608  × 36864 | 16,245 | 24,537 |   978 |
+| 128 × 15360 ×  3840 | 13,212 | 16,903 | 1,905 |
+| 128 × 24576 ×  3072 | 11,509 |  9,755 | 1,671 |
+| 128 × 36864 ×  4608 | 11,525 | 14,743 |   827 |
+| 256 × 3072  × 24576 | 15,214 | 21,712 |   998 |
+| 256 × 3840  × 15360 | 22,361 | 23,024 | 2,214 |
+| 256 × 4608  × 36864 | 15,255 | 23,727 | 1,257 |
+| 256 × 15360 ×  3840 | 12,406 | 11,057 | 1,787 |
+| 256 × 24576 ×  3072 | 12,057 | 11,550 | 1,481 |
+| 256 × 36864 ×  4608 | 12,801 | 21,655 |   949 |
+| 512 × 3072  × 24576 | 12,540 | 25,586 | 1,085 |
+| 512 × 3840  × 15360 | 13,771 | 24,325 | 1,171 |
+| 512 × 4608  × 36864 | 11,759 | 25,207 | 1,391 |
+| 512 × 15360 ×  3840 | 10,919 | 21,186 |   947 |
+| 512 × 24576 ×  3072 | 11,031 | 19,639 |   964 |
+| 512 × 36864 ×  4608 | 11,576 | 19,732 | 1,125 |
+
+**Summary.** Across the 18 shapes:
+
+- **bf16** averages ~14 TFLOPS, with the best shapes (M=256, small K, wide N) hitting over 22 TFLOPS.
+- **s8** averages ~20 TFLOPS — about **1.4× bf16** on the same shapes. The AMX INT8 compute density is 2× bf16 in theory, and the gap between 2× and 1.4× is where memory bandwidth and packing overhead eat the margin.
+- **f32** averages ~1.2 TFLOPS — roughly **one-tenth of bf16**. There's no AMX path for f32, so the kernels fall back to AVX-512 FMA. AMX's bf16 TMUL delivers 1024 FLOPs/core/cycle against AVX-512 FMA at 64, so the theoretical bf16/f32 ceiling is about **16×**. We're measuring ~12×, so f32 lands at roughly 75% of its ratio-to-bf16 budget — below peak, but not by the order of magnitude the raw TFLOPS numbers first suggest. The f32 path also skips the Step 4 packing machinery (`get_B_pack_type` returns `no_trans` for f32, so B is read straight from raw row-major) and uses 16×16 tiles against bf16's 32×32, which inflates kernel-launch overhead per byte of output.
+
+![Performance for different dtypes](images2/perf_comparison.png)
+
+*Figure: Performance measured on different sized matrix multiplication for different datatypes.*
+
+A few shapes buck the s8 > bf16 ordering — notably 128 × 24576 × 3072 and the 256 × M×3840 row — where the s8 kernel is memory-bound hard enough that the doubled compute throughput doesn't show up. These are the shapes where the adaptive-dispatch heuristic from Step 8 is most worth revisiting.
+
+### How close are we to the ceiling?
+
+Raw TFLOPS numbers tell you what we achieve; they don't tell you what the CPU is capable of in the first place. For that, oneDNN ships [`benchdnn`](https://github.com/uxlfoundation/oneDNN/blob/main/tests/benchdnn/README.md) — a reference tool that drives oneDNN's own high-level `matmul` primitive with its own internal threading and layout choices. On a given CPU, for a given shape and dtype, `benchdnn` numbers are a reasonable proxy for "what the ukernel is capable of when well-orchestrated."
+
+Comparing our bf16 results against `benchdnn` bf16 on the same box gives us a *percentage-of-ceiling* metric that strips the raw hardware peak out of the picture: 90% of benchdnn on one shape means our outer dispatch is leaving ~10% on the table there, independent of how many TFLOPS the CPU can theoretically produce.
+
+![benchdnn vs our implementation for bfloat16 matmul](images2/vs_benchdnn.png)
+
+*Figure: Performance TFLOPs of our implementation of bfloat16 matmul compared to benchdnn on 1 NUMA node. Our implementation lags behind benchdnn on almost all shapes — there's still performance to squeeze out of the tuning and dispatch heuristics.*
+
+The chart is a readable verdict on the staged dispatch machinery. Where our fixed N-strip partitioning from Step 3 happens to match what `benchdnn` does internally, we're close to parity. Where it doesn't — the shapes where the bar-height ratio sags visibly below 1 — we're paying for a dispatch choice that Step 8's heuristic is too crude to see. Those are the shapes a better `should_go_2d` policy (or an actual cost model, or K-parallel when appropriate) would recover.
+
+We leave f32 and s8 out of this ceiling check. f32 is under-tuned in our library as Steps 4 and 6 already hinted, and s8 has enough memory-bound shapes that a ceiling metric needs a roofline model rather than just a ratio. The bf16 comparison is the cleanest single-picture read on how well the outer tiling + packing + dispatch machinery from Steps 1–8 is wired up.
+
+---
+
+## References
+
+- [oneDNN Documentation — Micro-kernel API](https://oneapi-src.github.io/oneDNN/)
+- [oneDNN GitHub Repository](https://github.com/oneapi-src/oneDNN)
+- [AMX Programming Reference](https://www.intel.com/content/www/us/en/developer/articles/technical/advanced-matrix-extensions-intro.html)
+- [benchdnn](https://github.com/uxlfoundation/oneDNN/blob/main/tests/benchdnn/README.md)
+- [PerfSpect](https://github.com/intel/PerfSpect)
+- Part 1: [Accelerating Deep Learning Workloads on Modern CPUs](blog_post.md)
+
+---
+
+*Bibek Bhattarai*
+
+---
